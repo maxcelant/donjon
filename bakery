@@ -3,12 +3,13 @@ set -euo pipefail
 
 STATE_FILE="${BAKERY_STATE:-${HOME}/.bakery/state.json}"
 PI_SESSION_DIR="${PI_CODING_AGENT_SESSION_DIR:-${PI_CODING_AGENT_DIR:-${HOME}/.pi/agent}/sessions}"
+CLAUDE_SESSION_DIR="${CLAUDE_CONFIG_DIR:-${HOME}/.claude}/projects"
 
 usage() {
   cat <<'EOF'
 Usage:
-  bakery new --name NAME --dir DIR [--harness pi] [--custom-id ID]
-  bakery onboard --name NAME --id SESSION_ID
+  bakery new --name NAME --dir DIR [--harness pi|claude] [--custom-id ID]
+  bakery onboard --name NAME --id SESSION_ID [--harness pi|claude]
   bakery ls
   bakery resume --id ID_OR_PREFIX
   bakery rm ID_OR_PREFIX
@@ -32,7 +33,7 @@ init_state() {
   fi
 }
 
-# Prints: directory<TAB>session-id. Exact IDs/custom IDs win; otherwise a
+# Prints: directory<TAB>session-id<TAB>harness. Exact IDs/custom IDs win; otherwise a
 # unique session-ID prefix is accepted.
 lookup() {
   python3 - "$STATE_FILE" "$1" <<'PY'
@@ -51,15 +52,15 @@ if not matches:
 if len(matches) > 1:
     raise SystemExit(f"bakery: {query!r} is ambiguous")
 r = matches[0]
-print(f'{r["dir"]}\t{r["id"]}')
+print(f'{r["dir"]}\t{r["id"]}\t{r.get("harness", "pi")}')
 PY
 }
 
 register_agent() {
-  local name=$1 dir=$2 id=$3 custom_id=${4:-}
-  python3 - "$STATE_FILE" "$name" "$dir" "$id" "$custom_id" <<'PY'
+  local name=$1 dir=$2 harness=$3 id=$4 custom_id=${5:-}
+  python3 - "$STATE_FILE" "$name" "$dir" "$harness" "$id" "$custom_id" <<'PY'
 import json, os, sys, tempfile
-path, name, directory, session_id, custom_id = sys.argv[1:]
+path, name, directory, harness, session_id, custom_id = sys.argv[1:]
 try:
     with open(path) as f:
         rows = json.load(f)
@@ -71,7 +72,7 @@ if any(r.get("id") == session_id for r in rows):
     raise SystemExit(f"bakery: session {session_id!r} is already registered")
 if custom_id and any(r.get("customId") == custom_id for r in rows):
     raise SystemExit(f"bakery: custom id {custom_id!r} already exists")
-row = {"name": name, "dir": directory, "harness": "pi", "id": session_id}
+row = {"name": name, "dir": directory, "harness": harness, "id": session_id}
 if custom_id:
     row["customId"] = custom_id
 rows.append(row)
@@ -109,28 +110,33 @@ new_agent() {
 
   [[ -n "$name" ]] || die 'new requires --name'
   [[ -n "$dir" ]] || die 'new requires --dir'
-  [[ "$harness" == pi ]] || die "unsupported harness: $harness (only pi is supported)"
-  command -v pi >/dev/null 2>&1 || die 'pi is not installed or not in PATH'
+  [[ "$harness" == pi || "$harness" == claude ]] || die "unsupported harness: $harness"
+  command -v "$harness" >/dev/null 2>&1 || die "$harness is not installed or not in PATH"
   dir=$(cd -- "$dir" 2>/dev/null && pwd -P) || die "directory does not exist: $dir"
 
   init_state
   local id
   id=$(python3 -c 'import uuid; print(uuid.uuid4())')
 
-  register_agent "$name" "$dir" "$id" "$custom_id"
+  register_agent "$name" "$dir" "$harness" "$id" "$custom_id"
 
   cd -- "$dir"
-  exec pi --session-id "$id" --name "$name"
+  case "$harness" in
+    pi) exec pi --session-id "$id" --name "$name" ;;
+    claude) exec claude --session-id "$id" --name "$name" ;;
+  esac
 }
 
 onboard_agent() {
-  local name='' id=''
+  local name='' id='' harness='pi'
   while (($#)); do
     case "$1" in
       --name)
         need_arg "$@"; name=$2; shift 2 ;;
       --id)
         need_arg "$@"; id=$2; shift 2 ;;
+      --harness)
+        need_arg "$@"; harness=$2; shift 2 ;;
       -h|--help)
         usage; exit 0 ;;
       *) die "unknown option for onboard: $1" ;;
@@ -139,14 +145,18 @@ onboard_agent() {
 
   [[ -n "$name" ]] || die 'onboard requires --name'
   [[ -n "$id" ]] || die 'onboard requires --id'
+  [[ "$harness" == pi || "$harness" == claude ]] || die "unsupported harness: $harness"
   init_state
 
+  local session_root=$PI_SESSION_DIR
+  [[ "$harness" == claude ]] && session_root=$CLAUDE_SESSION_DIR
   local dir
-  dir=$(python3 - "$PI_SESSION_DIR" "$id" <<'PY'
+  dir=$(python3 - "$session_root" "$id" "$harness" <<'PY'
 import json, os, sys
-root, session_id = sys.argv[1:]
+root, session_id, harness = sys.argv[1:]
+label = "Pi" if harness == "pi" else "Claude Code"
 if not os.path.isdir(root):
-    raise SystemExit(f"bakery: Pi session directory does not exist: {root}")
+    raise SystemExit(f"bakery: {label} session directory does not exist: {root}")
 
 matches = []
 for directory, _, files in os.walk(root):
@@ -156,26 +166,38 @@ for directory, _, files in os.walk(root):
         path = os.path.join(directory, filename)
         try:
             with open(path) as f:
-                header = json.loads(f.readline())
+                if harness == "pi":
+                    header = json.loads(f.readline())
+                    if header.get("type") == "session" and header.get("id") == session_id:
+                        matches.append((path, header.get("cwd")))
+                elif filename == f"{session_id}.jsonl":
+                    cwd = None
+                    found_id = False
+                    for line in f:
+                        entry = json.loads(line)
+                        found_id = found_id or entry.get("sessionId") == session_id
+                        cwd = cwd or entry.get("cwd")
+                        if found_id and cwd:
+                            break
+                    if found_id:
+                        matches.append((path, cwd))
         except (OSError, json.JSONDecodeError):
             continue
-        if header.get("type") == "session" and header.get("id") == session_id:
-            matches.append((path, header.get("cwd")))
 
 if not matches:
-    raise SystemExit(f"bakery: no Pi session matches {session_id!r}")
+    raise SystemExit(f"bakery: no {label} session matches {session_id!r}")
 if len(matches) > 1:
-    raise SystemExit(f"bakery: Pi session {session_id!r} is ambiguous")
+    raise SystemExit(f"bakery: {label} session {session_id!r} is ambiguous")
 _, cwd = matches[0]
 if not isinstance(cwd, str) or not cwd:
-    raise SystemExit(f"bakery: Pi session {session_id!r} has no working directory")
+    raise SystemExit(f"bakery: {label} session {session_id!r} has no working directory")
 print(cwd)
 PY
 )
   [[ -d "$dir" ]] || die "session directory no longer exists: $dir"
   dir=$(cd -- "$dir" && pwd -P)
-  register_agent "$name" "$dir" "$id"
-  printf 'Onboarded %s (%s)\n' "$name" "$id"
+  register_agent "$name" "$dir" "$harness" "$id"
+  printf 'Onboarded %s %s session (%s)\n' "$name" "$harness" "$id"
 }
 
 list_agents() {
@@ -193,10 +215,10 @@ if not rows:
     raise SystemExit
 task_width = max(4, *(len(r.get("name", "")) for r in rows))
 project_width = max(7, *(len(r.get("dir", "")) for r in rows))
-print(f'{"TASK":<{task_width}}  {"PROJECT":<{project_width}}  ID')
+print(f'{"TASK":<{task_width}}  {"PROJECT":<{project_width}}  HARNESS  ID')
 for r in rows:
     ident = r.get("customId") or r.get("id", "")
-    print(f'{r.get("name", ""):<{task_width}}  {r.get("dir", ""):<{project_width}}  {ident}')
+    print(f'{r.get("name", ""):<{task_width}}  {r.get("dir", ""):<{project_width}}  {r.get("harness", "pi"):<7}  {ident}')
 PY
 }
 
@@ -213,21 +235,25 @@ resume_agent() {
   done
   [[ -n "$query" ]] || die 'resume requires --id'
   init_state
-  local record dir id
+  local record dir id harness
   record=$(lookup "$query")
-  IFS=$'\t' read -r dir id <<<"$record"
+  IFS=$'\t' read -r dir id harness <<<"$record"
   [[ -d "$dir" ]] || die "directory no longer exists: $dir"
-  command -v pi >/dev/null 2>&1 || die 'pi is not installed or not in PATH'
+  command -v "$harness" >/dev/null 2>&1 || die "$harness is not installed or not in PATH"
   cd -- "$dir"
-  exec pi --session "$id"
+  case "$harness" in
+    pi) exec pi --session "$id" ;;
+    claude) exec claude --resume "$id" ;;
+    *) die "unsupported harness in registry: $harness" ;;
+  esac
 }
 
 remove_agent() {
   [[ $# -eq 1 ]] || die 'rm requires exactly one ID or prefix'
   init_state
-  local record id
+  local record dir id harness
   record=$(lookup "$1")
-  id=${record#*$'\t'}
+  IFS=$'\t' read -r dir id harness <<<"$record"
   python3 - "$STATE_FILE" "$id" <<'PY'
 import json, os, sys, tempfile
 path, session_id = sys.argv[1:]

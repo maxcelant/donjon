@@ -1,12 +1,12 @@
 # Bakery
 
-A small Bash wrapper for naming, tracking, and resuming [Pi](https://github.com/badlogic/pi-mono) sessions.
+A small Bash wrapper for naming, tracking, and resuming [Pi](https://github.com/badlogic/pi-mono) and [Claude Code](https://docs.anthropic.com/en/docs/claude-code) sessions.
 
 ## Requirements
 
 - Bash
 - Python 3
-- `pi` available on `PATH`
+- `pi` and/or `claude` available on `PATH`
 
 ## Install
 
@@ -19,15 +19,16 @@ Ensure `~/.local/bin` is on your `PATH`, or run `./bakery` directly.
 
 ## Usage
 
-Start and register a new Pi session:
+Start and register a new session (Pi is the default harness):
 
 ```bash
 bakery new --name "Some task" --dir /path/to/project --custom-id abc
+bakery new --name "Claude task" --dir /path/to/project --harness claude
 ```
 
-`--custom-id` is optional. `--harness pi` is accepted for compatibility; Pi is currently the only supported harness.
+`--custom-id` is optional. `--harness` accepts `pi` or `claude`.
 
-Bakery starts Pi in the specified directory and stores its registry in `~/.bakery/state.json`:
+Bakery starts the selected harness in the specified directory and stores its registry in `~/.bakery/state.json`:
 
 ```json
 [
@@ -41,13 +42,14 @@ Bakery starts Pi in the specified directory and stores its registry in `~/.baker
 ]
 ```
 
-Add an existing Pi session to Bakery's registry:
+Add an existing Pi or Claude Code session to Bakery's registry:
 
 ```bash
-bakery onboard --name "Existing task" --id 019f90b0-7871-7827-a180-8c02fe990cac
+bakery onboard --name "Existing Pi task" --id 019f90b0-7871-7827-a180-8c02fe990cac
+bakery onboard --name "Existing Claude task" --id 550e8400-e29b-41d4-a716-446655440000 --harness claude
 ```
 
-Bakery finds the session in Pi's session directory and reads its project directory from the session file. It honors `PI_CODING_AGENT_SESSION_DIR` and `PI_CODING_AGENT_DIR`.
+Bakery finds the session and reads its project directory from the transcript. Pi lookup honors `PI_CODING_AGENT_SESSION_DIR` and `PI_CODING_AGENT_DIR`; Claude Code lookup honors `CLAUDE_CONFIG_DIR`.
 
 List registered sessions:
 
@@ -56,9 +58,9 @@ bakery ls
 ```
 
 ```text
-TASK                   PROJECT                         ID
-Fix bug                /path/to/project                abc
-Add mTLS to feature X  /path/to/another-project        019f90b0-7871-7827-a180-8c02fe990dad
+TASK                   PROJECT                         HARNESS  ID
+Fix bug                /path/to/project                pi       abc
+Add mTLS to feature X  /path/to/another-project        claude   019f90b0-7871-7827-a180-8c02fe990dad
 ```
 
 Resume by custom ID or a unique session-ID prefix:
