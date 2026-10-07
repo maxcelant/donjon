@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_FILE="${BAKERY_STATE:-${HOME}/.bakery/state.json}"
+PI_SESSION_DIR="${PI_CODING_AGENT_SESSION_DIR:-${PI_CODING_AGENT_DIR:-${HOME}/.pi/agent}/sessions}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  bakery new --name NAME --dir DIR [--harness pi] [--custom-id ID]
+  bakery onboard --name NAME --id SESSION_ID
+  bakery ls
+  bakery resume --id ID_OR_PREFIX
+  bakery rm ID_OR_PREFIX
+EOF
+}
+
+die() {
+  printf 'bakery: %s\n' "$*" >&2
+  exit 1
+}
+
+need_arg() {
+  [[ $# -ge 2 && -n "$2" ]] || die "$1 requires a value"
+}
+
+init_state() {
+  mkdir -p -- "$(dirname -- "$STATE_FILE")"
+  if [[ ! -e "$STATE_FILE" ]]; then
+    printf '[]\n' >"$STATE_FILE"
+    chmod 600 "$STATE_FILE"
+  fi
+}
+
+# Prints: directory<TAB>session-id. Exact IDs/custom IDs win; otherwise a
+# unique session-ID prefix is accepted.
+lookup() {
+  python3 - "$STATE_FILE" "$1" <<'PY'
+import json, sys
+path, query = sys.argv[1:]
+try:
+    with open(path) as f:
+        rows = json.load(f)
+except (OSError, json.JSONDecodeError) as e:
+    raise SystemExit(f"bakery: cannot read {path}: {e}")
+
+exact = [r for r in rows if r.get("id") == query or r.get("customId") == query]
+matches = exact if exact else [r for r in rows if r.get("id", "").startswith(query)]
+if not matches:
+    raise SystemExit(f"bakery: no agent matches {query!r}")
+if len(matches) > 1:
+    raise SystemExit(f"bakery: {query!r} is ambiguous")
+r = matches[0]
+print(f'{r["dir"]}\t{r["id"]}')
+PY
+}
+
+register_agent() {
+  local name=$1 dir=$2 id=$3 custom_id=${4:-}
+  python3 - "$STATE_FILE" "$name" "$dir" "$id" "$custom_id" <<'PY'
+import json, os, sys, tempfile
+path, name, directory, session_id, custom_id = sys.argv[1:]
+try:
+    with open(path) as f:
+        rows = json.load(f)
+except (OSError, json.JSONDecodeError) as e:
+    raise SystemExit(f"bakery: cannot read {path}: {e}")
+if not isinstance(rows, list):
+    raise SystemExit(f"bakery: {path} must contain a JSON array")
+if any(r.get("id") == session_id for r in rows):
+    raise SystemExit(f"bakery: session {session_id!r} is already registered")
+if custom_id and any(r.get("customId") == custom_id for r in rows):
+    raise SystemExit(f"bakery: custom id {custom_id!r} already exists")
+row = {"name": name, "dir": directory, "harness": "pi", "id": session_id}
+if custom_id:
+    row["customId"] = custom_id
+rows.append(row)
+fd, tmp = tempfile.mkstemp(prefix=".state.", dir=os.path.dirname(path), text=True)
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump(rows, f, indent=2)
+        f.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+except BaseException:
+    try: os.unlink(tmp)
+    except OSError: pass
+    raise
+PY
+}
+
+new_agent() {
+  local name='' dir='' harness='pi' custom_id=''
+  while (($#)); do
+    case "$1" in
+      --name)
+        need_arg "$@"; name=$2; shift 2 ;;
+      --dir)
+        need_arg "$@"; dir=$2; shift 2 ;;
+      --harness)
+        need_arg "$@"; harness=$2; shift 2 ;;
+      --custom-id)
+        need_arg "$@"; custom_id=$2; shift 2 ;;
+      -h|--help)
+        usage; exit 0 ;;
+      *) die "unknown option for new: $1" ;;
+    esac
+  done
+
+  [[ -n "$name" ]] || die 'new requires --name'
+  [[ -n "$dir" ]] || die 'new requires --dir'
+  [[ "$harness" == pi ]] || die "unsupported harness: $harness (only pi is supported)"
+  command -v pi >/dev/null 2>&1 || die 'pi is not installed or not in PATH'
+  dir=$(cd -- "$dir" 2>/dev/null && pwd -P) || die "directory does not exist: $dir"
+
+  init_state
+  local id
+  id=$(python3 -c 'import uuid; print(uuid.uuid4())')
+
+  register_agent "$name" "$dir" "$id" "$custom_id"
+
+  cd -- "$dir"
+  exec pi --session-id "$id" --name "$name"
+}
+
+onboard_agent() {
+  local name='' id=''
+  while (($#)); do
+    case "$1" in
+      --name)
+        need_arg "$@"; name=$2; shift 2 ;;
+      --id)
+        need_arg "$@"; id=$2; shift 2 ;;
+      -h|--help)
+        usage; exit 0 ;;
+      *) die "unknown option for onboard: $1" ;;
+    esac
+  done
+
+  [[ -n "$name" ]] || die 'onboard requires --name'
+  [[ -n "$id" ]] || die 'onboard requires --id'
+  init_state
+
+  local dir
+  dir=$(python3 - "$PI_SESSION_DIR" "$id" <<'PY'
+import json, os, sys
+root, session_id = sys.argv[1:]
+if not os.path.isdir(root):
+    raise SystemExit(f"bakery: Pi session directory does not exist: {root}")
+
+matches = []
+for directory, _, files in os.walk(root):
+    for filename in files:
+        if not filename.endswith(".jsonl"):
+            continue
+        path = os.path.join(directory, filename)
+        try:
+            with open(path) as f:
+                header = json.loads(f.readline())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if header.get("type") == "session" and header.get("id") == session_id:
+            matches.append((path, header.get("cwd")))
+
+if not matches:
+    raise SystemExit(f"bakery: no Pi session matches {session_id!r}")
+if len(matches) > 1:
+    raise SystemExit(f"bakery: Pi session {session_id!r} is ambiguous")
+_, cwd = matches[0]
+if not isinstance(cwd, str) or not cwd:
+    raise SystemExit(f"bakery: Pi session {session_id!r} has no working directory")
+print(cwd)
+PY
+)
+  [[ -d "$dir" ]] || die "session directory no longer exists: $dir"
+  dir=$(cd -- "$dir" && pwd -P)
+  register_agent "$name" "$dir" "$id"
+  printf 'Onboarded %s (%s)\n' "$name" "$id"
+}
+
+list_agents() {
+  init_state
+  python3 - "$STATE_FILE" <<'PY'
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        rows = json.load(f)
+except (OSError, json.JSONDecodeError) as e:
+    raise SystemExit(f"bakery: cannot read {path}: {e}")
+if not rows:
+    print("No registered agents.")
+    raise SystemExit
+task_width = max(4, *(len(r.get("name", "")) for r in rows))
+project_width = max(7, *(len(r.get("dir", "")) for r in rows))
+print(f'{"TASK":<{task_width}}  {"PROJECT":<{project_width}}  ID')
+for r in rows:
+    ident = r.get("customId") or r.get("id", "")
+    print(f'{r.get("name", ""):<{task_width}}  {r.get("dir", ""):<{project_width}}  {ident}')
+PY
+}
+
+resume_agent() {
+  local query=''
+  while (($#)); do
+    case "$1" in
+      --id)
+        need_arg "$@"; query=$2; shift 2 ;;
+      -h|--help)
+        usage; exit 0 ;;
+      *) die "unknown option for resume: $1" ;;
+    esac
+  done
+  [[ -n "$query" ]] || die 'resume requires --id'
+  init_state
+  local record dir id
+  record=$(lookup "$query")
+  IFS=$'\t' read -r dir id <<<"$record"
+  [[ -d "$dir" ]] || die "directory no longer exists: $dir"
+  command -v pi >/dev/null 2>&1 || die 'pi is not installed or not in PATH'
+  cd -- "$dir"
+  exec pi --session "$id"
+}
+
+remove_agent() {
+  [[ $# -eq 1 ]] || die 'rm requires exactly one ID or prefix'
+  init_state
+  local record id
+  record=$(lookup "$1")
+  id=${record#*$'\t'}
+  python3 - "$STATE_FILE" "$id" <<'PY'
+import json, os, sys, tempfile
+path, session_id = sys.argv[1:]
+with open(path) as f:
+    rows = json.load(f)
+rows = [r for r in rows if r.get("id") != session_id]
+fd, tmp = tempfile.mkstemp(prefix=".state.", dir=os.path.dirname(path), text=True)
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump(rows, f, indent=2)
+        f.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+except BaseException:
+    try: os.unlink(tmp)
+    except OSError: pass
+    raise
+PY
+}
+
+(($#)) || { usage; exit 1; }
+command=$1
+shift
+case "$command" in
+  new) new_agent "$@" ;;
+  onboard) onboard_agent "$@" ;;
+  ls) (($# == 0)) || die 'ls takes no arguments'; list_agents ;;
+  resume) resume_agent "$@" ;;
+  rm) remove_agent "$@" ;;
+  -h|--help|help) usage ;;
+  *) die "unknown command: $command" ;;
+esac
