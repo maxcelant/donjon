@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STATE_FILE="${BAKERY_STATE:-${HOME}/.bakery/state.json}"
+STATE_FILE="${DONJON_STATE:-${HOME}/.donjon/state.json}"
 PI_SESSION_DIR="${PI_CODING_AGENT_SESSION_DIR:-${PI_CODING_AGENT_DIR:-${HOME}/.pi/agent}/sessions}"
 CLAUDE_SESSION_DIR="${CLAUDE_CONFIG_DIR:-${HOME}/.claude}/projects"
 
 usage() {
   cat <<'EOF'
 Usage:
-  bakery new --name NAME --dir DIR [--harness pi|claude] [--custom-id ID]
-  bakery onboard --name NAME --id SESSION_ID [--harness pi|claude]
-  bakery ls
-  bakery resume --id ID_OR_PREFIX
-  bakery rm ID_OR_PREFIX
+  donjon new --name NAME --dir DIR [--harness pi|claude] [--custom-id ID]
+  donjon onboard --name NAME --id SESSION_ID [--harness pi|claude]
+  donjon ls
+  donjon attach --id ID_OR_PREFIX
+  donjon rm ID_OR_PREFIX
 EOF
 }
 
 die() {
-  printf 'bakery: %s\n' "$*" >&2
+  printf 'donjon: %s\n' "$*" >&2
   exit 1
 }
 
@@ -43,14 +43,14 @@ try:
     with open(path) as f:
         rows = json.load(f)
 except (OSError, json.JSONDecodeError) as e:
-    raise SystemExit(f"bakery: cannot read {path}: {e}")
+    raise SystemExit(f"donjon: cannot read {path}: {e}")
 
 exact = [r for r in rows if r.get("id") == query or r.get("customId") == query]
 matches = exact if exact else [r for r in rows if r.get("id", "").startswith(query)]
 if not matches:
-    raise SystemExit(f"bakery: no agent matches {query!r}")
+    raise SystemExit(f"donjon: no agent matches {query!r}")
 if len(matches) > 1:
-    raise SystemExit(f"bakery: {query!r} is ambiguous")
+    raise SystemExit(f"donjon: {query!r} is ambiguous")
 r = matches[0]
 print(f'{r["dir"]}\t{r["id"]}\t{r.get("harness", "pi")}')
 PY
@@ -65,13 +65,13 @@ try:
     with open(path) as f:
         rows = json.load(f)
 except (OSError, json.JSONDecodeError) as e:
-    raise SystemExit(f"bakery: cannot read {path}: {e}")
+    raise SystemExit(f"donjon: cannot read {path}: {e}")
 if not isinstance(rows, list):
-    raise SystemExit(f"bakery: {path} must contain a JSON array")
+    raise SystemExit(f"donjon: {path} must contain a JSON array")
 if any(r.get("id") == session_id for r in rows):
-    raise SystemExit(f"bakery: session {session_id!r} is already registered")
+    raise SystemExit(f"donjon: session {session_id!r} is already registered")
 if custom_id and any(r.get("customId") == custom_id for r in rows):
-    raise SystemExit(f"bakery: custom id {custom_id!r} already exists")
+    raise SystemExit(f"donjon: custom id {custom_id!r} already exists")
 row = {"name": name, "dir": directory, "harness": harness, "id": session_id}
 if custom_id:
     row["customId"] = custom_id
@@ -156,7 +156,7 @@ import json, os, sys
 root, session_id, harness = sys.argv[1:]
 label = "Pi" if harness == "pi" else "Claude Code"
 if not os.path.isdir(root):
-    raise SystemExit(f"bakery: {label} session directory does not exist: {root}")
+    raise SystemExit(f"donjon: {label} session directory does not exist: {root}")
 
 matches = []
 for directory, _, files in os.walk(root):
@@ -185,12 +185,12 @@ for directory, _, files in os.walk(root):
             continue
 
 if not matches:
-    raise SystemExit(f"bakery: no {label} session matches {session_id!r}")
+    raise SystemExit(f"donjon: no {label} session matches {session_id!r}")
 if len(matches) > 1:
-    raise SystemExit(f"bakery: {label} session {session_id!r} is ambiguous")
+    raise SystemExit(f"donjon: {label} session {session_id!r} is ambiguous")
 _, cwd = matches[0]
 if not isinstance(cwd, str) or not cwd:
-    raise SystemExit(f"bakery: {label} session {session_id!r} has no working directory")
+    raise SystemExit(f"donjon: {label} session {session_id!r} has no working directory")
 print(cwd)
 PY
 )
@@ -209,7 +209,7 @@ try:
     with open(path) as f:
         rows = json.load(f)
 except (OSError, json.JSONDecodeError) as e:
-    raise SystemExit(f"bakery: cannot read {path}: {e}")
+    raise SystemExit(f"donjon: cannot read {path}: {e}")
 if not rows:
     print("No registered agents.")
     raise SystemExit
@@ -222,7 +222,7 @@ for r in rows:
 PY
 }
 
-resume_agent() {
+attach_agent() {
   local query=''
   while (($#)); do
     case "$1" in
@@ -230,10 +230,10 @@ resume_agent() {
         need_arg "$@"; query=$2; shift 2 ;;
       -h|--help)
         usage; exit 0 ;;
-      *) die "unknown option for resume: $1" ;;
+      *) die "unknown option for attach: $1" ;;
     esac
   done
-  [[ -n "$query" ]] || die 'resume requires --id'
+  [[ -n "$query" ]] || die 'attach requires --id'
   init_state
   local record dir id harness
   record=$(lookup "$query")
@@ -281,7 +281,7 @@ case "$command" in
   new) new_agent "$@" ;;
   onboard) onboard_agent "$@" ;;
   ls) (($# == 0)) || die 'ls takes no arguments'; list_agents ;;
-  resume) resume_agent "$@" ;;
+  attach) attach_agent "$@" ;;
   rm) remove_agent "$@" ;;
   -h|--help|help) usage ;;
   *) die "unknown command: $command" ;;
