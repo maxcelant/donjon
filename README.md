@@ -58,9 +58,9 @@ donjon ls
 ```
 
 ```text
-TASK                   PROJECT                         HARNESS  ID
-Fix bug                /path/to/project                pi       abc
-Add mTLS to feature X  /path/to/another-project        claude   019f90b0-7871-7827-a180-8c02fe990dad
+ID        TASK                   PROJECT                         HARNESS
+abc       Fix bug                /path/to/project                pi
+019f90b0  Add mTLS to feature X  /path/to/another-project        claude
 ```
 
 Interactively choose and attach to a session with fuzzy search. Press Enter or click a row:
