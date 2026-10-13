@@ -1,10 +1,9 @@
 # Donjon
 
-A small Bash wrapper for naming, tracking, and attaching to [Pi](https://github.com/badlogic/pi-mono) and [Claude Code](https://docs.anthropic.com/en/docs/claude-code) sessions.
+A small CLI for naming, tracking, and attaching to [Pi](https://github.com/badlogic/pi-mono) and [Claude Code](https://docs.anthropic.com/en/docs/claude-code) sessions.
 
 ## Requirements
 
-- Bash
 - Python 3
 - `pi` and/or `claude` available on `PATH`
 - [`fzf`](https://github.com/junegunn/fzf) for the interactive session picker

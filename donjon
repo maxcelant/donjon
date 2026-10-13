@@ -1,323 +1,333 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import uuid
+from pathlib import Path
 
-STATE_FILE="${DONJON_STATE:-${HOME}/.donjon/state.json}"
-PI_SESSION_DIR="${PI_CODING_AGENT_SESSION_DIR:-${PI_CODING_AGENT_DIR:-${HOME}/.pi/agent}/sessions}"
-CLAUDE_SESSION_DIR="${CLAUDE_CONFIG_DIR:-${HOME}/.claude}/projects"
+def env_path(name, default):
+    return Path(os.environ.get(name) or default)
 
-usage() {
-  cat <<'EOF'
-Usage:
-  donjon new --name NAME --dir DIR [--harness pi|claude] [--custom-id ID]
-  donjon onboard --name NAME --id SESSION_ID [--harness pi|claude]
-  donjon ls
-  donjon sessions
-  donjon attach --id ID_OR_PREFIX
-  donjon rm ID_OR_PREFIX
-EOF
-}
 
-die() {
-  printf 'donjon: %s\n' "$*" >&2
-  exit 1
-}
+STATE_FILE = env_path("DONJON_STATE", Path.home() / ".donjon/state.json")
+PI_SESSION_DIR = env_path(
+    "PI_CODING_AGENT_SESSION_DIR",
+    env_path("PI_CODING_AGENT_DIR", Path.home() / ".pi/agent") / "sessions",
+)
+CLAUDE_SESSION_DIR = env_path("CLAUDE_CONFIG_DIR", Path.home() / ".claude") / "projects"
 
-need_arg() {
-  [[ $# -ge 2 && -n "$2" ]] || die "$1 requires a value"
-}
 
-init_state() {
-  mkdir -p -- "$(dirname -- "$STATE_FILE")"
-  if [[ ! -e "$STATE_FILE" ]]; then
-    printf '[]\n' >"$STATE_FILE"
-    chmod 600 "$STATE_FILE"
-  fi
-}
+class DonjonError(Exception):
+    pass
 
-# Prints: directory<TAB>session-id<TAB>harness. Exact IDs/custom IDs win; otherwise a
-# unique session-ID prefix is accepted.
-lookup() {
-  python3 - "$STATE_FILE" "$1" <<'PY'
-import json, sys
-path, query = sys.argv[1:]
-try:
-    with open(path) as f:
-        rows = json.load(f)
-except (OSError, json.JSONDecodeError) as e:
-    raise SystemExit(f"donjon: cannot read {path}: {e}")
 
-exact = [r for r in rows if r.get("id") == query or r.get("customId") == query]
-matches = exact if exact else [r for r in rows if r.get("id", "").startswith(query)]
-if not matches:
-    raise SystemExit(f"donjon: no agent matches {query!r}")
-if len(matches) > 1:
-    raise SystemExit(f"donjon: {query!r} is ambiguous")
-r = matches[0]
-print(f'{r["dir"]}\t{r["id"]}\t{r.get("harness", "pi")}')
-PY
-}
+def fail(message):
+    raise DonjonError(message)
 
-register_agent() {
-  local name=$1 dir=$2 harness=$3 id=$4 custom_id=${5:-}
-  python3 - "$STATE_FILE" "$name" "$dir" "$harness" "$id" "$custom_id" <<'PY'
-import json, os, sys, tempfile
-path, name, directory, harness, session_id, custom_id = sys.argv[1:]
-try:
-    with open(path) as f:
-        rows = json.load(f)
-except (OSError, json.JSONDecodeError) as e:
-    raise SystemExit(f"donjon: cannot read {path}: {e}")
-if not isinstance(rows, list):
-    raise SystemExit(f"donjon: {path} must contain a JSON array")
-if any(r.get("id") == session_id for r in rows):
-    raise SystemExit(f"donjon: session {session_id!r} is already registered")
-if custom_id and any(r.get("customId") == custom_id for r in rows):
-    raise SystemExit(f"donjon: custom id {custom_id!r} already exists")
-row = {"name": name, "dir": directory, "harness": harness, "id": session_id}
-if custom_id:
-    row["customId"] = custom_id
-rows.append(row)
-fd, tmp = tempfile.mkstemp(prefix=".state.", dir=os.path.dirname(path), text=True)
-try:
-    with os.fdopen(fd, "w") as f:
-        json.dump(rows, f, indent=2)
-        f.write("\n")
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
-except BaseException:
-    try: os.unlink(tmp)
-    except OSError: pass
-    raise
-PY
-}
 
-new_agent() {
-  local name='' dir='' harness='pi' custom_id=''
-  while (($#)); do
-    case "$1" in
-      --name)
-        need_arg "$@"; name=$2; shift 2 ;;
-      --dir)
-        need_arg "$@"; dir=$2; shift 2 ;;
-      --harness)
-        need_arg "$@"; harness=$2; shift 2 ;;
-      --custom-id)
-        need_arg "$@"; custom_id=$2; shift 2 ;;
-      -h|--help)
-        usage; exit 0 ;;
-      *) die "unknown option for new: $1" ;;
-    esac
-  done
+def init_state():
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not STATE_FILE.exists():
+        STATE_FILE.write_text("[]\n")
+        STATE_FILE.chmod(0o600)
 
-  [[ -n "$name" ]] || die 'new requires --name'
-  [[ -n "$dir" ]] || die 'new requires --dir'
-  [[ "$harness" == pi || "$harness" == claude ]] || die "unsupported harness: $harness"
-  command -v "$harness" >/dev/null 2>&1 || die "$harness is not installed or not in PATH"
-  dir=$(cd -- "$dir" 2>/dev/null && pwd -P) || die "directory does not exist: $dir"
 
-  init_state
-  local id
-  id=$(python3 -c 'import uuid; print(uuid.uuid4())')
+def read_state():
+    try:
+        rows = json.loads(STATE_FILE.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        fail(f"cannot read {STATE_FILE}: {error}")
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        fail(f"{STATE_FILE} must contain a JSON array of objects")
+    return rows
 
-  register_agent "$name" "$dir" "$harness" "$id" "$custom_id"
 
-  cd -- "$dir"
-  case "$harness" in
-    pi) exec pi --session-id "$id" --name "$name" ;;
-    claude) exec claude --session-id "$id" --name "$name" ;;
-  esac
-}
-
-onboard_agent() {
-  local name='' id='' harness='pi'
-  while (($#)); do
-    case "$1" in
-      --name)
-        need_arg "$@"; name=$2; shift 2 ;;
-      --id)
-        need_arg "$@"; id=$2; shift 2 ;;
-      --harness)
-        need_arg "$@"; harness=$2; shift 2 ;;
-      -h|--help)
-        usage; exit 0 ;;
-      *) die "unknown option for onboard: $1" ;;
-    esac
-  done
-
-  [[ -n "$name" ]] || die 'onboard requires --name'
-  [[ -n "$id" ]] || die 'onboard requires --id'
-  [[ "$harness" == pi || "$harness" == claude ]] || die "unsupported harness: $harness"
-  init_state
-
-  local session_root=$PI_SESSION_DIR
-  [[ "$harness" == claude ]] && session_root=$CLAUDE_SESSION_DIR
-  local dir
-  dir=$(python3 - "$session_root" "$id" "$harness" <<'PY'
-import json, os, sys
-root, session_id, harness = sys.argv[1:]
-label = "Pi" if harness == "pi" else "Claude Code"
-if not os.path.isdir(root):
-    raise SystemExit(f"donjon: {label} session directory does not exist: {root}")
-
-matches = []
-for directory, _, files in os.walk(root):
-    for filename in files:
-        if not filename.endswith(".jsonl"):
-            continue
-        path = os.path.join(directory, filename)
+def write_state(rows):
+    fd, temporary = tempfile.mkstemp(prefix=".state.", dir=STATE_FILE.parent, text=True)
+    try:
+        with os.fdopen(fd, "w") as file:
+            json.dump(rows, file, indent=2)
+            file.write("\n")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, STATE_FILE)
+    except BaseException:
         try:
-            with open(path) as f:
-                if harness == "pi":
-                    header = json.loads(f.readline())
-                    if header.get("type") == "session" and header.get("id") == session_id:
-                        matches.append((path, header.get("cwd")))
-                elif filename == f"{session_id}.jsonl":
-                    cwd = None
-                    found_id = False
-                    for line in f:
-                        entry = json.loads(line)
-                        found_id = found_id or entry.get("sessionId") == session_id
-                        cwd = cwd or entry.get("cwd")
-                        if found_id and cwd:
-                            break
-                    if found_id:
-                        matches.append((path, cwd))
-        except (OSError, json.JSONDecodeError):
-            continue
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
 
-if not matches:
-    raise SystemExit(f"donjon: no {label} session matches {session_id!r}")
-if len(matches) > 1:
-    raise SystemExit(f"donjon: {label} session {session_id!r} is ambiguous")
-_, cwd = matches[0]
-if not isinstance(cwd, str) or not cwd:
-    raise SystemExit(f"donjon: {label} session {session_id!r} has no working directory")
-print(cwd)
-PY
-)
-  [[ -d "$dir" ]] || die "session directory no longer exists: $dir"
-  dir=$(cd -- "$dir" && pwd -P)
-  register_agent "$name" "$dir" "$harness" "$id"
-  printf 'Onboarded %s %s session (%s)\n' "$name" "$harness" "$id"
-}
 
-list_agents() {
-  init_state
-  python3 - "$STATE_FILE" <<'PY'
-import json, sys
-path = sys.argv[1]
-try:
-    with open(path) as f:
-        rows = json.load(f)
-except (OSError, json.JSONDecodeError) as e:
-    raise SystemExit(f"donjon: cannot read {path}: {e}")
-if not rows:
-    print("No registered agents.")
-    raise SystemExit
-task_width = max(4, *(len(r.get("name", "")) for r in rows))
-project_width = max(7, *(len(r.get("dir", "")) for r in rows))
-print(f'{"TASK":<{task_width}}  {"PROJECT":<{project_width}}  HARNESS  ID')
-for r in rows:
-    ident = r.get("customId") or r.get("id", "")
-    print(f'{r.get("name", ""):<{task_width}}  {r.get("dir", ""):<{project_width}}  {r.get("harness", "pi"):<7}  {ident}')
-PY
-}
+def register_agent(name, directory, harness, session_id, custom_id=None):
+    rows = read_state()
+    if any(row.get("id") == session_id for row in rows):
+        fail(f"session {session_id!r} is already registered")
+    if custom_id and any(row.get("customId") == custom_id for row in rows):
+        fail(f"custom id {custom_id!r} already exists")
+    row = {"name": name, "dir": directory, "harness": harness, "id": session_id}
+    if custom_id:
+        row["customId"] = custom_id
+    rows.append(row)
+    write_state(rows)
 
-select_session() {
-  command -v fzf >/dev/null 2>&1 || die 'fzf is not installed or not in PATH'
-  init_state
-  local choices selected id
-  choices=$(python3 - "$STATE_FILE" <<'PY'
-import json, sys
-path = sys.argv[1]
-try:
-    with open(path) as f:
-        rows = json.load(f)
-except (OSError, json.JSONDecodeError) as e:
-    raise SystemExit(f"donjon: cannot read {path}: {e}")
-if not rows:
-    raise SystemExit
-name_width = max(4, *(len(r.get("name", "")) for r in rows))
-project_width = max(7, *(len(r.get("dir", "")) for r in rows))
-print(f'\t{"TASK":<{name_width}}  {"PROJECT":<{project_width}}  HARNESS  ID')
-for r in rows:
-    session_id = r.get("id", "")
-    ident = r.get("customId") or session_id
-    display = f'{r.get("name", ""):<{name_width}}  {r.get("dir", ""):<{project_width}}  {r.get("harness", "pi"):<7}  {ident}'
-    print(f'{session_id}\t{display}')
-PY
-)
-  [[ -n "$choices" ]] || { printf 'No registered agents.\n'; return; }
-  selected=$(printf '%s\n' "$choices" | fzf \
-    --delimiter=$'\t' --with-nth=2 --header-lines=1 --layout=reverse --border \
-    --prompt='Session> ' --bind='left-click:accept') || return 0
-  id=${selected%%$'\t'*}
-  attach_agent --id "$id"
-}
 
-attach_agent() {
-  local query=''
-  while (($#)); do
-    case "$1" in
-      --id)
-        need_arg "$@"; query=$2; shift 2 ;;
-      -h|--help)
-        usage; exit 0 ;;
-      *) die "unknown option for attach: $1" ;;
-    esac
-  done
-  [[ -n "$query" ]] || die 'attach requires --id'
-  init_state
-  local record dir id harness
-  record=$(lookup "$query")
-  IFS=$'\t' read -r dir id harness <<<"$record"
-  [[ -d "$dir" ]] || die "directory no longer exists: $dir"
-  command -v "$harness" >/dev/null 2>&1 || die "$harness is not installed or not in PATH"
-  cd -- "$dir"
-  case "$harness" in
-    pi) exec pi --session "$id" ;;
-    claude) exec claude --resume "$id" ;;
-    *) die "unsupported harness in registry: $harness" ;;
-  esac
-}
+def lookup(query):
+    rows = read_state()
+    exact = [row for row in rows if row.get("id") == query or row.get("customId") == query]
+    matches = exact or [row for row in rows if row.get("id", "").startswith(query)]
+    if not matches:
+        fail(f"no agent matches {query!r}")
+    if len(matches) > 1:
+        fail(f"{query!r} is ambiguous")
+    return matches[0]
 
-remove_agent() {
-  [[ $# -eq 1 ]] || die 'rm requires exactly one ID or prefix'
-  init_state
-  local record dir id harness
-  record=$(lookup "$1")
-  IFS=$'\t' read -r dir id harness <<<"$record"
-  python3 - "$STATE_FILE" "$id" <<'PY'
-import json, os, sys, tempfile
-path, session_id = sys.argv[1:]
-with open(path) as f:
-    rows = json.load(f)
-rows = [r for r in rows if r.get("id") != session_id]
-fd, tmp = tempfile.mkstemp(prefix=".state.", dir=os.path.dirname(path), text=True)
-try:
-    with os.fdopen(fd, "w") as f:
-        json.dump(rows, f, indent=2)
-        f.write("\n")
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
-except BaseException:
-    try: os.unlink(tmp)
-    except OSError: pass
-    raise
-PY
-  printf 'Removed agent %s\n' "$id"
-}
 
-(($#)) || { usage; exit 1; }
-command=$1
-shift
-case "$command" in
-  new) new_agent "$@" ;;
-  onboard) onboard_agent "$@" ;;
-  ls) (($# == 0)) || die 'ls takes no arguments'; list_agents ;;
-  sessions) (($# == 0)) || die 'sessions takes no arguments'; select_session ;;
-  attach) attach_agent "$@" ;;
-  rm) remove_agent "$@" ;;
-  -h|--help|help) usage ;;
-  *) die "unknown command: $command" ;;
-esac
+def require_command(command):
+    if not shutil.which(command):
+        fail(f"{command} is not installed or not in PATH")
+
+
+def attach_record(row):
+    directory = row.get("dir", "")
+    session_id = row.get("id", "")
+    harness = row.get("harness", "pi")
+    if not os.path.isdir(directory):
+        fail(f"directory no longer exists: {directory}")
+    require_command(harness)
+    os.chdir(directory)
+    if harness == "pi":
+        os.execvp("pi", ["pi", "--session", session_id])
+    if harness == "claude":
+        os.execvp("claude", ["claude", "--resume", session_id])
+    fail(f"unsupported harness in registry: {harness}")
+
+
+def new_agent(args):
+    require_command(args.harness)
+    if not os.path.isdir(args.dir):
+        fail(f"directory does not exist: {args.dir}")
+    directory = os.path.realpath(args.dir)
+    init_state()
+    session_id = str(uuid.uuid4())
+    register_agent(args.name, directory, args.harness, session_id, args.custom_id)
+    os.chdir(directory)
+    os.execvp(
+        args.harness,
+        [args.harness, "--session-id", session_id, "--name", args.name],
+    )
+
+
+def find_session_directory(root, session_id, harness):
+    label = "Pi" if harness == "pi" else "Claude Code"
+    if not root.is_dir():
+        fail(f"{label} session directory does not exist: {root}")
+
+    matches = []
+    for directory, _, filenames in os.walk(root):
+        for filename in filenames:
+            if not filename.endswith(".jsonl"):
+                continue
+            path = Path(directory) / filename
+            try:
+                with path.open() as file:
+                    if harness == "pi":
+                        header = json.loads(file.readline())
+                        if header.get("type") == "session" and header.get("id") == session_id:
+                            matches.append((path, header.get("cwd")))
+                    elif filename == f"{session_id}.jsonl":
+                        cwd = None
+                        found_id = False
+                        for line in file:
+                            entry = json.loads(line)
+                            found_id = found_id or entry.get("sessionId") == session_id
+                            cwd = cwd or entry.get("cwd")
+                            if found_id and cwd:
+                                break
+                        if found_id:
+                            matches.append((path, cwd))
+            except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+                continue
+
+    if not matches:
+        fail(f"no {label} session matches {session_id!r}")
+    if len(matches) > 1:
+        fail(f"{label} session {session_id!r} is ambiguous")
+    cwd = matches[0][1]
+    if not isinstance(cwd, str) or not cwd:
+        fail(f"{label} session {session_id!r} has no working directory")
+    return cwd
+
+
+def onboard_agent(args):
+    init_state()
+    root = PI_SESSION_DIR if args.harness == "pi" else CLAUDE_SESSION_DIR
+    directory = find_session_directory(root, args.id, args.harness)
+    if not os.path.isdir(directory):
+        fail(f"session directory no longer exists: {directory}")
+    directory = os.path.realpath(directory)
+    register_agent(args.name, directory, args.harness, args.id)
+    print(f"Onboarded {args.name} {args.harness} session ({args.id})")
+
+
+def paint(text, code, enabled):
+    return f"\033[{code}m{text}\033[0m" if enabled else text
+
+
+def display_rows(rows, color=False):
+    name_width = max(4, *(len(str(row.get("name", ""))) for row in rows))
+    project_width = max(7, *(len(str(row.get("dir", ""))) for row in rows))
+    yield "  ".join(
+        (
+            paint(f'{"TASK":<{name_width}}', "1;36", color),
+            paint(f'{"PROJECT":<{project_width}}', "1;34", color),
+            paint("HARNESS", "1;35", color),
+            paint("ID", "1;33", color),
+        )
+    )
+    for row in rows:
+        name = str(row.get("name", ""))
+        directory = str(row.get("dir", ""))
+        harness = str(row.get("harness", "pi"))
+        ident = str(row.get("customId") or row.get("id", ""))
+        harness_color = "32" if harness == "pi" else "35"
+        yield "  ".join(
+            (
+                paint(f"{name:<{name_width}}", "36", color),
+                paint(f"{directory:<{project_width}}", "34", color),
+                paint(f"{harness:<7}", harness_color, color),
+                paint(ident, "33", color),
+            )
+        )
+
+
+def list_agents(_args):
+    init_state()
+    rows = read_state()
+    if not rows:
+        print("No registered agents.")
+        return
+    color = sys.stdout.isatty() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
+    print("\n".join(display_rows(rows, color=color)))
+
+
+def clean_display(value):
+    return str(value).replace("\t", " ").replace("\r", " ").replace("\n", " ")
+
+
+def select_session(_args):
+    require_command("fzf")
+    init_state()
+    rows = read_state()
+    if not rows:
+        print("No registered agents.")
+        return
+
+    clean_rows = [
+        {
+            **row,
+            "name": clean_display(row.get("name", "")),
+            "dir": clean_display(row.get("dir", "")),
+            "harness": clean_display(row.get("harness", "pi")),
+            "customId": clean_display(row.get("customId", "")),
+            "id": clean_display(row.get("id", "")),
+        }
+        for row in rows
+    ]
+    displayed = list(display_rows(clean_rows))
+    choices = [f"\t{displayed[0]}"] + [
+        f"{index}\t{line}" for index, line in enumerate(displayed[1:])
+    ]
+    result = subprocess.run(
+        [
+            "fzf",
+            "--delimiter=\t",
+            "--with-nth=2",
+            "--header-lines=1",
+            "--layout=reverse",
+            "--border",
+            "--prompt=Session> ",
+            "--bind=left-click:accept",
+        ],
+        input="\n".join(choices) + "\n",
+        text=True,
+        stdout=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode in (1, 130):
+        return
+    if result.returncode:
+        fail(f"fzf exited with status {result.returncode}")
+    try:
+        index = int(result.stdout.partition("\t")[0])
+        row = rows[index]
+    except (ValueError, IndexError):
+        fail("fzf returned an invalid selection")
+    attach_record(row)
+
+
+def attach_agent(args):
+    init_state()
+    attach_record(lookup(args.id))
+
+
+def remove_agent(args):
+    init_state()
+    row = lookup(args.id)
+    session_id = row.get("id", "")
+    rows = [candidate for candidate in read_state() if candidate.get("id") != session_id]
+    write_state(rows)
+    print(f"Removed agent {session_id}")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="donjon",
+        description="Name, track, and attach to Pi and Claude Code sessions.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    new = commands.add_parser("new", help="start and register a new session")
+    new.add_argument("--name", required=True)
+    new.add_argument("--dir", required=True)
+    new.add_argument("--harness", choices=("pi", "claude"), default="pi")
+    new.add_argument("--custom-id")
+    new.set_defaults(handler=new_agent)
+
+    onboard = commands.add_parser("onboard", help="register an existing session")
+    onboard.add_argument("--name", required=True)
+    onboard.add_argument("--id", required=True)
+    onboard.add_argument("--harness", choices=("pi", "claude"), default="pi")
+    onboard.set_defaults(handler=onboard_agent)
+
+    listing = commands.add_parser("ls", help="list registered sessions")
+    listing.set_defaults(handler=list_agents)
+
+    sessions = commands.add_parser("sessions", help="interactively choose a session")
+    sessions.set_defaults(handler=select_session)
+
+    attach = commands.add_parser("attach", help="attach to a registered session")
+    attach.add_argument("--id", required=True, help="custom ID or session ID prefix")
+    attach.set_defaults(handler=attach_agent)
+
+    remove = commands.add_parser("rm", help="remove a session from the registry")
+    remove.add_argument("id", help="custom ID or session ID prefix")
+    remove.set_defaults(handler=remove_agent)
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+    try:
+        args.handler(args)
+    except DonjonError as error:
+        print(f"donjon: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
