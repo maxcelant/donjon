@@ -1,11 +1,11 @@
 # Donjon
 
-A small CLI for naming, tracking, and attaching to [Pi](https://github.com/badlogic/pi-mono) and [Claude Code](https://docs.anthropic.com/en/docs/claude-code) sessions.
+A small CLI for naming, tracking, and attaching to [Pi](https://github.com/badlogic/pi-mono), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), and [Codex](https://github.com/openai/codex) sessions.
 
 ## Requirements
 
 - Python 3
-- `pi` and/or `claude` available on `PATH`
+- `pi`, `claude`, and/or `codex` available on `PATH`
 - [`fzf`](https://github.com/junegunn/fzf) for the interactive session picker
 
 ## Install
@@ -23,6 +23,8 @@ To install elsewhere, set `DONJON_INSTALL_DIR`. Set `DONJON_VERSION` to install 
 Edit `~/.donjon/config.yaml` to configure executable and data paths:
 
 ```yaml
+defaultHarness: "pi"
+
 pi:
   path: ""
   sessionDir: ""
@@ -31,14 +33,18 @@ claude:
   path: ""
   sessionDir: ""
 
+codex:
+  path: ""
+  sessionDir: ""
+
 tools:
   fzf:
     path: ""
 ```
 
-Leave a value empty to use its default. Command paths default to names available on `PATH`; session directories default to `~/.pi/agent/sessions` and `~/.claude/projects`. Donjon creates this file on first run if the installer has not already created it.
+Set `defaultHarness` to `pi`, `claude`, or `codex`. Leave path values empty to use their defaults. Command paths default to names available on `PATH`; session directories default to `~/.pi/agent/sessions`, `~/.claude/projects`, and `~/.codex/sessions`. Donjon creates this file on first run if the installer has not already created it.
 
-Environment variables override configuration. Existing variables `DONJON_STATE`, `PI_CODING_AGENT_SESSION_DIR`, `PI_CODING_AGENT_DIR`, and `CLAUDE_CONFIG_DIR` remain supported. `DONJON_PI_PATH`, `DONJON_CLAUDE_PATH`, and `DONJON_FZF_PATH` override executable paths. Set `DONJON_CONFIG` to use another config file.
+Environment variables override configuration. Existing variables `DONJON_STATE`, `PI_CODING_AGENT_SESSION_DIR`, `PI_CODING_AGENT_DIR`, `CLAUDE_CONFIG_DIR`, and `CODEX_HOME` remain supported. `DONJON_DEFAULT_HARNESS`, `DONJON_PI_PATH`, `DONJON_CLAUDE_PATH`, `DONJON_CODEX_PATH`, and `DONJON_FZF_PATH` provide direct overrides. Set `DONJON_CONFIG` to use another config file.
 
 ## Usage
 
@@ -47,9 +53,10 @@ Start and register a new session (Pi is the default harness):
 ```bash
 donjon new --name "Some task" --dir /path/to/project --custom-id abc
 donjon new --name "Claude task" --dir /path/to/project --harness claude
+donjon new --name "Codex task" --dir /path/to/project --harness codex
 ```
 
-`--custom-id` is optional. `--harness` accepts `pi` or `claude`.
+`--custom-id` is optional. `--harness` accepts `pi`, `claude`, or `codex` and defaults to `defaultHarness` from the config.
 
 Donjon starts the selected harness in the specified directory and stores its registry in `~/.donjon/state.json`:
 
@@ -70,9 +77,10 @@ Add an existing Pi or Claude Code session to Donjon's registry:
 ```bash
 donjon onboard --name "Existing Pi task" --id 019f90b0-7871-7827-a180-8c02fe990cac
 donjon onboard --name "Existing Claude task" --id 550e8400-e29b-41d4-a716-446655440000 --harness claude
+donjon onboard --name "Existing Codex task" --id 019c33da-d5bf-7073-9f86-abe7f9a4f1c1 --harness codex
 ```
 
-Donjon finds the session and reads its project directory from the transcript. Pi lookup honors `PI_CODING_AGENT_SESSION_DIR` and `PI_CODING_AGENT_DIR`; Claude Code lookup honors `CLAUDE_CONFIG_DIR`.
+Donjon finds the session and reads its project directory from the transcript. Pi lookup honors `PI_CODING_AGENT_SESSION_DIR` and `PI_CODING_AGENT_DIR`; Claude Code lookup honors `CLAUDE_CONFIG_DIR`; Codex lookup honors `CODEX_HOME`.
 
 List registered sessions:
 

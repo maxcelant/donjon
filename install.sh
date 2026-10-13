@@ -28,11 +28,17 @@ trap - EXIT HUP INT TERM
 
 if [ ! -e "$config" ]; then
     cat >"$config" <<'EOF'
+defaultHarness: "pi"
+
 pi:
   path: ""
   sessionDir: ""
 
 claude:
+  path: ""
+  sessionDir: ""
+
+codex:
   path: ""
   sessionDir: ""
 

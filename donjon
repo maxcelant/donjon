@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -21,18 +22,28 @@ CONFIG_FILE = Path(
     )
 )
 CONFIG_LEAVES = {
+    "defaultHarness",
     "pi.path",
     "pi.sessionDir",
     "claude.path",
     "claude.sessionDir",
+    "codex.path",
+    "codex.sessionDir",
     "tools.fzf.path",
 }
-CONFIG_BRANCHES = {"pi", "claude", "tools", "tools.fzf"}
-CONFIG_TEMPLATE = """pi:
+CONFIG_BRANCHES = {"pi", "claude", "codex", "tools", "tools.fzf"}
+CONFIG_TEMPLATE = """
+defaultHarness: "pi"
+
+pi:
   path: ""
   sessionDir: ""
 
 claude:
+  path: ""
+  sessionDir: ""
+
+codex:
   path: ""
   sessionDir: ""
 
@@ -44,7 +55,9 @@ tools:
 STATE_FILE = Path.home() / ".donjon/state.json"
 PI_SESSION_DIR = Path.home() / ".pi/agent/sessions"
 CLAUDE_SESSION_DIR = Path.home() / ".claude/projects"
-COMMAND_PATHS = {"pi": "pi", "claude": "claude", "fzf": "fzf"}
+CODEX_SESSION_DIR = Path.home() / ".codex/sessions"
+DEFAULT_HARNESS = "pi"
+COMMAND_PATHS = {"pi": "pi", "claude": "claude", "codex": "codex", "fzf": "fzf"}
 
 
 def init_config():
@@ -109,7 +122,8 @@ def expand_path(value):
 
 
 def configure():
-    global STATE_FILE, PI_SESSION_DIR, CLAUDE_SESSION_DIR, COMMAND_PATHS
+    global STATE_FILE, PI_SESSION_DIR, CLAUDE_SESSION_DIR, CODEX_SESSION_DIR
+    global DEFAULT_HARNESS, COMMAND_PATHS
     config = read_config()
     state = os.environ.get("DONJON_STATE") or "~/.donjon/state.json"
     pi_sessions = os.environ.get("PI_CODING_AGENT_SESSION_DIR")
@@ -120,12 +134,20 @@ def configure():
     claude_sessions = config.get("claude.sessionDir")
     if os.environ.get("CLAUDE_CONFIG_DIR"):
         claude_sessions = str(expand_path(os.environ["CLAUDE_CONFIG_DIR"]) / "projects")
+    codex_home = os.environ.get("CODEX_HOME") or "~/.codex"
+    codex_sessions = config.get("codex.sessionDir") or str(expand_path(codex_home) / "sessions")
+    default_harness = os.environ.get("DONJON_DEFAULT_HARNESS") or config.get("defaultHarness") or "pi"
+    if default_harness not in ("pi", "claude", "codex"):
+        fail(f"invalid defaultHarness {default_harness!r}")
     STATE_FILE = expand_path(state)
     PI_SESSION_DIR = expand_path(pi_sessions)
     CLAUDE_SESSION_DIR = expand_path(claude_sessions or "~/.claude/projects")
+    CODEX_SESSION_DIR = expand_path(codex_sessions)
+    DEFAULT_HARNESS = default_harness
     COMMAND_PATHS = {
         "pi": os.environ.get("DONJON_PI_PATH") or config.get("pi.path") or "pi",
         "claude": os.environ.get("DONJON_CLAUDE_PATH") or config.get("claude.path") or "claude",
+        "codex": os.environ.get("DONJON_CODEX_PATH") or config.get("codex.path") or "codex",
         "fzf": os.environ.get("DONJON_FZF_PATH") or config.get("tools.fzf.path") or "fzf",
     }
     COMMAND_PATHS = {
@@ -214,7 +236,56 @@ def attach_record(row):
         os.execvp(command, [command, "--session", session_id])
     if harness == "claude":
         os.execvp(command, [command, "--resume", session_id])
+    if harness == "codex":
+        os.execvp(command, [command, "resume", session_id])
     fail(f"unsupported harness in registry: {harness}")
+
+
+def codex_session_metadata(path):
+    try:
+        with path.open() as file:
+            entry = json.loads(file.readline())
+        if entry.get("type") != "session_meta":
+            return None
+        payload = entry.get("payload", {})
+        if isinstance(payload.get("id"), str) and isinstance(payload.get("cwd"), str):
+            return payload["id"], payload["cwd"]
+    except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+        pass
+    return None
+
+
+def wait_for_process(process):
+    while True:
+        try:
+            return process.wait()
+        except KeyboardInterrupt:
+            pass
+
+
+def new_codex_agent(args, command, directory):
+    before = set(CODEX_SESSION_DIR.rglob("*.jsonl")) if CODEX_SESSION_DIR.is_dir() else set()
+    os.chdir(directory)
+    process = subprocess.Popen([command])
+    while True:
+        candidates = []
+        if CODEX_SESSION_DIR.is_dir():
+            for path in CODEX_SESSION_DIR.rglob("*.jsonl"):
+                if path in before:
+                    continue
+                metadata = codex_session_metadata(path)
+                if metadata and os.path.realpath(metadata[1]) == directory:
+                    candidates.append(metadata[0])
+        if candidates:
+            register_agent(args.name, directory, "codex", candidates[0], args.custom_id)
+            return wait_for_process(process)
+        status = process.poll()
+        if status is not None:
+            fail(f"Codex exited with status {status} before creating a session")
+        try:
+            time.sleep(0.1)
+        except KeyboardInterrupt:
+            pass
 
 
 def new_agent(args):
@@ -223,6 +294,10 @@ def new_agent(args):
         fail(f"directory does not exist: {args.dir}")
     directory = os.path.realpath(args.dir)
     init_state()
+    if args.custom_id and any(row.get("customId") == args.custom_id for row in read_state()):
+        fail(f"custom id {args.custom_id!r} already exists")
+    if args.harness == "codex":
+        return new_codex_agent(args, command, directory)
     session_id = str(uuid.uuid4())
     register_agent(args.name, directory, args.harness, session_id, args.custom_id)
     os.chdir(directory)
@@ -233,7 +308,8 @@ def new_agent(args):
 
 
 def find_session_directory(root, session_id, harness):
-    label = "Pi" if harness == "pi" else "Claude Code"
+    labels = {"pi": "Pi", "claude": "Claude Code", "codex": "Codex"}
+    label = labels[harness]
     if not root.is_dir():
         fail(f"{label} session directory does not exist: {root}")
 
@@ -249,7 +325,7 @@ def find_session_directory(root, session_id, harness):
                         header = json.loads(file.readline())
                         if header.get("type") == "session" and header.get("id") == session_id:
                             matches.append((path, header.get("cwd")))
-                    elif filename == f"{session_id}.jsonl":
+                    elif harness == "claude" and filename == f"{session_id}.jsonl":
                         cwd = None
                         found_id = False
                         for line in file:
@@ -260,6 +336,11 @@ def find_session_directory(root, session_id, harness):
                                 break
                         if found_id:
                             matches.append((path, cwd))
+                    elif harness == "codex":
+                        entry = json.loads(file.readline())
+                        payload = entry.get("payload", {})
+                        if entry.get("type") == "session_meta" and payload.get("id") == session_id:
+                            matches.append((path, payload.get("cwd")))
             except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
                 continue
 
@@ -275,7 +356,12 @@ def find_session_directory(root, session_id, harness):
 
 def onboard_agent(args):
     init_state()
-    root = PI_SESSION_DIR if args.harness == "pi" else CLAUDE_SESSION_DIR
+    roots = {
+        "pi": PI_SESSION_DIR,
+        "claude": CLAUDE_SESSION_DIR,
+        "codex": CODEX_SESSION_DIR,
+    }
+    root = roots[args.harness]
     directory = find_session_directory(root, args.id, args.harness)
     if not os.path.isdir(directory):
         fail(f"session directory no longer exists: {directory}")
@@ -401,21 +487,25 @@ def remove_agent(args):
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="donjon",
-        description="Name, track, and attach to Pi and Claude Code sessions.",
+        description="Name, track, and attach to Pi, Claude Code, and Codex sessions.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
     new = commands.add_parser("new", help="start and register a new session")
     new.add_argument("--name", required=True)
     new.add_argument("--dir", required=True)
-    new.add_argument("--harness", choices=("pi", "claude"), default="pi")
+    new.add_argument(
+        "--harness", choices=("pi", "claude", "codex"), default=DEFAULT_HARNESS
+    )
     new.add_argument("--custom-id")
     new.set_defaults(handler=new_agent)
 
     onboard = commands.add_parser("onboard", help="register an existing session")
     onboard.add_argument("--name", required=True)
     onboard.add_argument("--id", required=True)
-    onboard.add_argument("--harness", choices=("pi", "claude"), default="pi")
+    onboard.add_argument(
+        "--harness", choices=("pi", "claude", "codex"), default=DEFAULT_HARNESS
+    )
     onboard.set_defaults(handler=onboard_agent)
 
     listing = commands.add_parser("ls", help="list registered sessions")
@@ -438,7 +528,7 @@ def main():
     try:
         configure()
         args = build_parser().parse_args()
-        args.handler(args)
+        return args.handler(args) or 0
     except DonjonError as error:
         print(f"donjon: {error}", file=sys.stderr)
         return 1
