@@ -7,6 +7,7 @@ A small Bash wrapper for naming, tracking, and attaching to [Pi](https://github.
 - Bash
 - Python 3
 - `pi` and/or `claude` available on `PATH`
+- [`fzf`](https://github.com/junegunn/fzf) for the interactive session picker
 
 ## Install
 
@@ -63,7 +64,13 @@ Fix bug                /path/to/project                pi       abc
 Add mTLS to feature X  /path/to/another-project        claude   019f90b0-7871-7827-a180-8c02fe990dad
 ```
 
-Attach by custom ID or a unique session-ID prefix:
+Interactively choose and attach to a session with fuzzy search. Press Enter or click a row:
+
+```bash
+donjon sessions
+```
+
+Attach directly by custom ID or a unique session-ID prefix:
 
 ```bash
 donjon attach --id abc

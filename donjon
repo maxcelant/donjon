@@ -11,6 +11,7 @@ Usage:
   donjon new --name NAME --dir DIR [--harness pi|claude] [--custom-id ID]
   donjon onboard --name NAME --id SESSION_ID [--harness pi|claude]
   donjon ls
+  donjon sessions
   donjon attach --id ID_OR_PREFIX
   donjon rm ID_OR_PREFIX
 EOF
@@ -222,6 +223,38 @@ for r in rows:
 PY
 }
 
+select_session() {
+  command -v fzf >/dev/null 2>&1 || die 'fzf is not installed or not in PATH'
+  init_state
+  local choices selected id
+  choices=$(python3 - "$STATE_FILE" <<'PY'
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        rows = json.load(f)
+except (OSError, json.JSONDecodeError) as e:
+    raise SystemExit(f"donjon: cannot read {path}: {e}")
+if not rows:
+    raise SystemExit
+name_width = max(4, *(len(r.get("name", "")) for r in rows))
+project_width = max(7, *(len(r.get("dir", "")) for r in rows))
+print(f'\t{"TASK":<{name_width}}  {"PROJECT":<{project_width}}  HARNESS  ID')
+for r in rows:
+    session_id = r.get("id", "")
+    ident = r.get("customId") or session_id
+    display = f'{r.get("name", ""):<{name_width}}  {r.get("dir", ""):<{project_width}}  {r.get("harness", "pi"):<7}  {ident}'
+    print(f'{session_id}\t{display}')
+PY
+)
+  [[ -n "$choices" ]] || { printf 'No registered agents.\n'; return; }
+  selected=$(printf '%s\n' "$choices" | fzf \
+    --delimiter=$'\t' --with-nth=2 --header-lines=1 --layout=reverse --border \
+    --prompt='Session> ' --bind='left-click:accept') || return 0
+  id=${selected%%$'\t'*}
+  attach_agent --id "$id"
+}
+
 attach_agent() {
   local query=''
   while (($#)); do
@@ -272,6 +305,7 @@ except BaseException:
     except OSError: pass
     raise
 PY
+  printf 'Removed agent %s\n' "$id"
 }
 
 (($#)) || { usage; exit 1; }
@@ -281,6 +315,7 @@ case "$command" in
   new) new_agent "$@" ;;
   onboard) onboard_agent "$@" ;;
   ls) (($# == 0)) || die 'ls takes no arguments'; list_agents ;;
+  sessions) (($# == 0)) || die 'sessions takes no arguments'; select_session ;;
   attach) attach_agent "$@" ;;
   rm) remove_agent "$@" ;;
   -h|--help|help) usage ;;
