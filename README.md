@@ -11,11 +11,34 @@ A small CLI for naming, tracking, and attaching to [Pi](https://github.com/badlo
 ## Install
 
 ```bash
-chmod +x donjon
-ln -s "$(pwd)/donjon" ~/.local/bin/donjon
+curl -fsSL https://raw.githubusercontent.com/maxcelant/donjon/main/install.sh | sh
 ```
 
-Ensure `~/.local/bin` is on your `PATH`, or run `./donjon` directly.
+This installs `donjon` in `~/.local/bin` and creates `~/.donjon/config.yaml`. Ensure `~/.local/bin` is on your `PATH`.
+
+To install elsewhere, set `DONJON_INSTALL_DIR`. Set `DONJON_VERSION` to install a tag or branch.
+
+## Configuration
+
+Edit `~/.donjon/config.yaml` to configure executable and data paths:
+
+```yaml
+pi:
+  path: ""
+  sessionDir: ""
+
+claude:
+  path: ""
+  sessionDir: ""
+
+tools:
+  fzf:
+    path: ""
+```
+
+Leave a value empty to use its default. Command paths default to names available on `PATH`; session directories default to `~/.pi/agent/sessions` and `~/.claude/projects`. Donjon creates this file on first run if the installer has not already created it.
+
+Environment variables override configuration. Existing variables `DONJON_STATE`, `PI_CODING_AGENT_SESSION_DIR`, `PI_CODING_AGENT_DIR`, and `CLAUDE_CONFIG_DIR` remain supported. `DONJON_PI_PATH`, `DONJON_CLAUDE_PATH`, and `DONJON_FZF_PATH` override executable paths. Set `DONJON_CONFIG` to use another config file.
 
 ## Usage
 

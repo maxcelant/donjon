@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import ast
 import json
 import os
 import shutil
@@ -9,20 +10,128 @@ import tempfile
 import uuid
 from pathlib import Path
 
-def env_path(name, default):
-    return Path(os.environ.get(name) or default)
-
-
-STATE_FILE = env_path("DONJON_STATE", Path.home() / ".donjon/state.json")
-PI_SESSION_DIR = env_path(
-    "PI_CODING_AGENT_SESSION_DIR",
-    env_path("PI_CODING_AGENT_DIR", Path.home() / ".pi/agent") / "sessions",
-)
-CLAUDE_SESSION_DIR = env_path("CLAUDE_CONFIG_DIR", Path.home() / ".claude") / "projects"
-
 
 class DonjonError(Exception):
     pass
+
+
+CONFIG_FILE = Path(
+    os.path.expandvars(
+        os.path.expanduser(os.environ.get("DONJON_CONFIG") or "~/.donjon/config.yaml")
+    )
+)
+CONFIG_LEAVES = {
+    "pi.path",
+    "pi.sessionDir",
+    "claude.path",
+    "claude.sessionDir",
+    "tools.fzf.path",
+}
+CONFIG_BRANCHES = {"pi", "claude", "tools", "tools.fzf"}
+CONFIG_TEMPLATE = """pi:
+  path: ""
+  sessionDir: ""
+
+claude:
+  path: ""
+  sessionDir: ""
+
+tools:
+  fzf:
+    path: ""
+"""
+
+STATE_FILE = Path.home() / ".donjon/state.json"
+PI_SESSION_DIR = Path.home() / ".pi/agent/sessions"
+CLAUDE_SESSION_DIR = Path.home() / ".claude/projects"
+COMMAND_PATHS = {"pi": "pi", "claude": "claude", "fzf": "fzf"}
+
+
+def init_config():
+    try:
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if not CONFIG_FILE.exists():
+            CONFIG_FILE.write_text(CONFIG_TEMPLATE)
+            CONFIG_FILE.chmod(0o600)
+    except OSError as error:
+        raise DonjonError(f"cannot initialize {CONFIG_FILE}: {error}") from error
+
+
+def read_config():
+    init_config()
+    values = {}
+    stack = []
+    try:
+        lines = CONFIG_FILE.read_text().splitlines()
+    except OSError as error:
+        raise DonjonError(f"cannot read {CONFIG_FILE}: {error}") from error
+    for number, line in enumerate(lines, 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "\t" in line:
+            raise DonjonError(f"tabs are not allowed at {CONFIG_FILE}:{number}")
+        indent = len(line) - len(line.lstrip(" "))
+        if indent % 2:
+            raise DonjonError(f"invalid indentation at {CONFIG_FILE}:{number}")
+        while stack and indent <= stack[-1][0]:
+            stack.pop()
+        if (stack and indent != stack[-1][0] + 2) or (not stack and indent):
+            raise DonjonError(f"invalid indentation at {CONFIG_FILE}:{number}")
+        key, separator, value = stripped.partition(":")
+        key = key.strip()
+        value = value.strip()
+        if not separator or not key:
+            raise DonjonError(f"invalid config at {CONFIG_FILE}:{number}")
+        full_key = ".".join([item[1] for item in stack] + [key])
+        if not value:
+            if full_key not in CONFIG_BRANCHES:
+                raise DonjonError(f"unknown config section {full_key!r} at {CONFIG_FILE}:{number}")
+            stack.append((indent, key))
+            continue
+        if full_key not in CONFIG_LEAVES:
+            raise DonjonError(f"unknown config key {full_key!r} at {CONFIG_FILE}:{number}")
+        if value[0] in "\"'":
+            try:
+                value = ast.literal_eval(value)
+            except (SyntaxError, ValueError) as error:
+                raise DonjonError(f"invalid value at {CONFIG_FILE}:{number}") from error
+            if not isinstance(value, str):
+                raise DonjonError(f"config value {full_key!r} must be a string")
+        else:
+            value = value.split(" #", 1)[0].rstrip()
+        values[full_key] = value
+    return values
+
+
+def expand_path(value):
+    return Path(os.path.expandvars(os.path.expanduser(value)))
+
+
+def configure():
+    global STATE_FILE, PI_SESSION_DIR, CLAUDE_SESSION_DIR, COMMAND_PATHS
+    config = read_config()
+    state = os.environ.get("DONJON_STATE") or "~/.donjon/state.json"
+    pi_sessions = os.environ.get("PI_CODING_AGENT_SESSION_DIR")
+    if not pi_sessions:
+        pi_sessions = config.get("pi.sessionDir")
+    if not pi_sessions:
+        pi_sessions = str(expand_path(os.environ.get("PI_CODING_AGENT_DIR", "~/.pi/agent")) / "sessions")
+    claude_sessions = config.get("claude.sessionDir")
+    if os.environ.get("CLAUDE_CONFIG_DIR"):
+        claude_sessions = str(expand_path(os.environ["CLAUDE_CONFIG_DIR"]) / "projects")
+    STATE_FILE = expand_path(state)
+    PI_SESSION_DIR = expand_path(pi_sessions)
+    CLAUDE_SESSION_DIR = expand_path(claude_sessions or "~/.claude/projects")
+    COMMAND_PATHS = {
+        "pi": os.environ.get("DONJON_PI_PATH") or config.get("pi.path") or "pi",
+        "claude": os.environ.get("DONJON_CLAUDE_PATH") or config.get("claude.path") or "claude",
+        "fzf": os.environ.get("DONJON_FZF_PATH") or config.get("tools.fzf.path") or "fzf",
+    }
+    COMMAND_PATHS = {
+        name: os.path.expandvars(os.path.expanduser(path))
+        for name, path in COMMAND_PATHS.items()
+    }
 
 
 def fail(message):
@@ -86,9 +195,11 @@ def lookup(query):
     return matches[0]
 
 
-def require_command(command):
+def require_command(name):
+    command = COMMAND_PATHS[name]
     if not shutil.which(command):
-        fail(f"{command} is not installed or not in PATH")
+        fail(f"{name} command not found: {command}")
+    return command
 
 
 def attach_record(row):
@@ -97,17 +208,17 @@ def attach_record(row):
     harness = row.get("harness", "pi")
     if not os.path.isdir(directory):
         fail(f"directory no longer exists: {directory}")
-    require_command(harness)
+    command = require_command(harness)
     os.chdir(directory)
     if harness == "pi":
-        os.execvp("pi", ["pi", "--session", session_id])
+        os.execvp(command, [command, "--session", session_id])
     if harness == "claude":
-        os.execvp("claude", ["claude", "--resume", session_id])
+        os.execvp(command, [command, "--resume", session_id])
     fail(f"unsupported harness in registry: {harness}")
 
 
 def new_agent(args):
-    require_command(args.harness)
+    command = require_command(args.harness)
     if not os.path.isdir(args.dir):
         fail(f"directory does not exist: {args.dir}")
     directory = os.path.realpath(args.dir)
@@ -116,8 +227,8 @@ def new_agent(args):
     register_agent(args.name, directory, args.harness, session_id, args.custom_id)
     os.chdir(directory)
     os.execvp(
-        args.harness,
-        [args.harness, "--session-id", session_id, "--name", args.name],
+        command,
+        [command, "--session-id", session_id, "--name", args.name],
     )
 
 
@@ -223,7 +334,7 @@ def clean_display(value):
 
 
 def select_session(_args):
-    require_command("fzf")
+    fzf = require_command("fzf")
     init_state()
     rows = read_state()
     if not rows:
@@ -247,7 +358,7 @@ def select_session(_args):
     ]
     result = subprocess.run(
         [
-            "fzf",
+            fzf,
             "--delimiter=\t",
             "--with-nth=2",
             "--header-lines=1",
@@ -324,8 +435,9 @@ def build_parser():
 
 
 def main():
-    args = build_parser().parse_args()
     try:
+        configure()
+        args = build_parser().parse_args()
         args.handler(args)
     except DonjonError as error:
         print(f"donjon: {error}", file=sys.stderr)
